@@ -1,0 +1,142 @@
+name: seal-build
+
+# Netty 4.1.45.Final ships no GitHub Actions CI. Upstream builds and tests in a
+# CentOS container (docker/Dockerfile.centos + docker/docker-compose.yaml:
+# `./mvnw -P boringssl clean install -Dio.netty.testsuite.badHost=netty.io`).
+# This workflow replays that inside centos:7 (glibc 2.17) so the JNI library in
+# the -linux-x86_64 jar does not pick up symbol versions from the runner's glibc.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TEST_FILTER: ${{ inputs.test-filter }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8 (mounted into the CentOS 7 container)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: seal-netty-4.1.45-${{ hashFiles('**/pom.xml') }}
+
+      - name: Write container build script
+        run: |
+          mkdir -p ~/.m2
+          cat > "$RUNNER_TEMP/build.sh" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          # CentOS 7 is EOL: point yum at the vault.
+          sed -i -e 's/^mirrorlist=/#mirrorlist=/' \
+                 -e 's|^#\s*baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+                 /etc/yum.repos.d/CentOS-*.repo
+          # Same package set as upstream docker/Dockerfile.centos (minus lsb-core).
+          yum install -y -q apr-devel autoconf automake gcc git glibc-devel libtool \
+            lksctp-tools make openssl-devel tar wget which unzip binutils
+          export JAVA_HOME=/jdk
+          export PATH=/jdk/bin:$PATH
+          java -version
+          gcc --version
+          ldd --version
+          cd /code
+          SKIPS="-Dcheckstyle.skip=true -Danimal.sniffer.skip=true -Dforbiddenapis.skip=true \
+            -Djapicmp.skip=true -DskipJapicmp=true -Drevapi.skip=true -Dxml.skip=true \
+            -Dmaven.javadoc.skip=true -Dsource.skip=true -Dgpg.skip=true -Drat.skip=true"
+          FILTER_ARGS=""
+          if [ -n "${TEST_FILTER:-}" ]; then
+            FILTER_ARGS="-Dtest=${TEST_FILTER} -DfailIfNoTests=false"
+          fi
+          # 1) build the reactor dependencies of transport-native-epoll
+          ./mvnw -B -e -Pboringssl clean install -pl transport-native-epoll -am -DskipTests $SKIPS
+          # 2) test + package transport-native-unix-common and transport-native-epoll
+          #    (install, not test: epoll unpacks unix-common's native classifier jar, MDEP-98)
+          ./mvnw -B -e -Pboringssl install -pl transport-native-unix-common,transport-native-epoll \
+            -Dio.netty.testsuite.badHost=netty.io $SKIPS $FILTER_ARGS
+          EOF
+          chmod +x "$RUNNER_TEMP/build.sh"
+
+      - name: Build and test inside centos:7 (glibc 2.17)
+        run: |
+          # The runner's JDK links cacerts to a host path; copy it dereferenced so
+          # the container sees the real trust store.
+          cp -rL "$JAVA_HOME" "$RUNNER_TEMP/jdk"
+          docker run --rm --network host \
+            -e TEST_FILTER \
+            -v "$GITHUB_WORKSPACE:/code" \
+            -v "$RUNNER_TEMP/jdk:/jdk:ro" \
+            -v "$HOME/.m2:/root/.m2" \
+            -v "$RUNNER_TEMP/build.sh:/build.sh:ro" \
+            centos:7 /build.sh
+
+      - name: Print skipped tests and their reasons
+        if: always()
+        run: |
+          set -eu
+          echo "Skipped testcases (from surefire XML reports):"
+          for f in transport-native-unix-common/target/surefire-reports/TEST-*.xml transport-native-epoll/target/surefire-reports/TEST-*.xml; do
+            [ -f "$f" ] || continue
+            awk '/<testcase /{tc=$0} /<skipped/{print "  SKIPPED: " tc " -> " $0}' "$f"
+          done
+          echo
+          echo "Reasons in source (Assume / @Ignore) for classes with skipped tests:"
+          grep -rn -E 'assume(True|False|That)?\(|@Ignore' \
+            transport-native-epoll/src/test/java \
+            testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketSslClientRenegotiateTest.java | head -100
+          echo
+          echo "Why Epoll*SslClientRenegotiateTest (2 x 64 cases) skip:"
+          echo "  testSslRenegotiationRejected starts with upstream's"
+          echo "    Assume.assumeFalse(\"BoringSSL\".equals(OpenSsl.versionString()));"
+          echo "  This build uses -Pboringssl (netty-tcnative-boringssl-static, as upstream's"
+          echo "  docker-compose test-boringssl-static service does); the test log above shows"
+          echo "  'netty-tcnative using native library: BoringSSL'. BoringSSL deliberately has no"
+          echo "  TLS renegotiation, so upstream skips the test there."
+          echo "  OpenSSL itself IS available: data() only creates the 64 OpenSslServerContext"
+          echo "  parameters when OpenSsl.isAvailable() is true (otherwise there would be 0 cases and"
+          echo "  an 'OpenSSL is unavailable' warning)."
+          echo "  The surefire message reads 'got: <false>, expected: is <true>' because JUnit 4.12"
+          echo "  implements assumeFalse(b) as assumeTrue(!b) -- bytecode of org.junit.Assume.assumeFalse:"
+          "$JAVA_HOME/bin/javap" -c -classpath ~/.m2/repository/junit/junit/4.12/junit-4.12.jar org.junit.Assume \
+            | sed -n '/public static void assumeFalse(boolean)/,/return/p'
+          echo
+          echo "Why EpollReuseAddrTest.testMultipleBindDatagramChannel (1 case) skips:"
+          echo "  upstream marks it @Ignore // TODO: Unignore after making it pass on centos6-1 and debian7-1"
+
+      - name: Check glibc symbol versions of the JNI library
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/so"
+          unzip -o -q transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final-linux-x86_64.jar \
+            'META-INF/native/*' -d "$RUNNER_TEMP/so"
+          SO="$RUNNER_TEMP/so/META-INF/native/libnetty_transport_native_epoll_x86_64.so"
+          objdump -T "$SO" | grep GLIBC_ | sort -k5
+          MAX=$(objdump -T "$SO" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "Highest required GLIBC version: $MAX"
+          if [ "$(printf '%s\n2.17\n' "$MAX" | sort -V | tail -1)" != "2.17" ]; then
+            echo "ERROR: JNI library requires GLIBC_$MAX (> 2.17)"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: netty-transport-native-epoll
+          if-no-files-found: error
+          path: |
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final.jar
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final-linux-x86_64.jar
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final-tests.jar
